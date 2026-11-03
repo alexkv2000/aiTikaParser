@@ -21,23 +21,29 @@ import java.io.IOException;
 import java.lang.reflect.Method;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Duration;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.TreeMap;
+import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
 /**
  * Разбор документов.
  * Маршрутизация:
- *  - OCR включён  → разбор в ТЕКУЩЕМ процессе (в дочернюю JVM Tika 4 не передаёт
- *    TesseractOCRConfig/PDFParserConfig, а OCR-парсер в форке не загружен).
+ *  - OCR включён  → разбор в ТЕКУЩЕМ процессе (Tika 4 сериализует ParseContext в JSON,
+ *    и конфиги OCR/PDF в дочернюю JVM не передаются).
  *  - OCR выключен → PipesForkParser (изоляция сбоев); если форк не смог вернуть
  *    текст или упал — автоматический повтор в текущем процессе.
  * Базовые настройки обоих процессов — tika-config.xml в jar.
  */
 public final class DocumentParserService implements AutoCloseable {
+
+    private static final Logger LOG = Logger.getLogger(DocumentParserService.class.getName());
 
     /** Результат одной попытки разбора (форк или текущий процесс). */
     private record Attempt(Metadata metadata, String text, boolean truncated, String error) { }
@@ -59,6 +65,10 @@ public final class DocumentParserService implements AutoCloseable {
             List.of("getExtractedText", "getText", "getContent", "getBody", "getPayload",
                     "getOutput", "getHtml");
 
+    /** Слова-маркеры «не той» природы таймаута (ожидание/завершение, а не сама задача). */
+    private static final List<String> NON_TASK_TIMEOUT_MARKERS =
+            List.of("wait", "idle", "shutdown", "exit", "noresponse", "submit", "emt");
+
     /** Таймаут задачи в форк-процессе: 5 минут. */
     private static final long FORK_TASK_TIMEOUT_MS = 300_000L;
 
@@ -79,7 +89,7 @@ public final class DocumentParserService implements AutoCloseable {
         // перезапуск дочерней JVM после N файлов — гигиена памяти при длительной работе
         if (!(trySet(config, "setMaxFilesPerProcess", int.class, 1000)
                 || trySet(config, "setMaxFilesPerProcess", long.class, 1000L))) {
-            System.err.println("WARN: setMaxFilesPerProcess не найден — дочерние процессы не перезапускаются.");
+            LOG.warning("setMaxFilesPerProcess не найден — дочерние процессы не перезапускаются.");
         }
         this.forkParser = new PipesForkParser(config);
     }
@@ -88,7 +98,7 @@ public final class DocumentParserService implements AutoCloseable {
         return defaultWriteLimit;
     }
 
-    /** Старая сигнатура: с настройками OCR по умолчанию (вкл., rus+chi_sim). */
+    /** Старая сигнатура: с настройками OCR по умолчанию (вкл., rus+chi_sim+eng). */
     public ParsedDocument parse(byte[] data, String fileName, int maxChars) {
         return parse(data, fileName, maxChars, OcrOptions.defaults());
     }
@@ -134,11 +144,9 @@ public final class DocumentParserService implements AutoCloseable {
     /* ─────────── пути разбора ─────────── */
 
     /**
-     * Разбор в дочерней JVM: parse(TikaInputStream, Metadata, ParseContext) → PipesForkResult.
-     * ParseContext — ПУСТОЙ: Tika 4 сериализует контекст в JSON, и незарегистрированные
-     * конфиги (PDFParserConfig и др.) рушат сериализацию («... is not registered»).
-     * Текст из PipesForkResult достаём автопоиском; если не вышло — возвращаем «ошибку»,
-     * и разбор автоматически повторится в текущем процессе.
+     * Разбор в дочерней JVM. ParseContext — ПУСТОЙ: Tika 4 сериализует контекст в JSON,
+     * и незарегистрированные конфиги (PDFParserConfig и др.) рушат сериализацию.
+     * Если текст достать не удалось — возвращаем «ошибку», разбор повторится локально.
      */
     private Attempt parseWithFork(byte[] data, String fileName, int limit) {
         Metadata metadata = new Metadata();
@@ -150,7 +158,7 @@ public final class DocumentParserService implements AutoCloseable {
             // исключение, пришедшее из дочерней JVM
             Throwable childError = invokeGetter(result, "getException", Throwable.class);
             if (childError != null) {
-                return new Attempt(metadata, "", false, describe(childError));
+                return failure(metadata, childError);
             }
 
             // метаданные из дочерней JVM
@@ -180,7 +188,7 @@ public final class DocumentParserService implements AutoCloseable {
             if (isWriteLimitReached(e)) {
                 return new Attempt(metadata, "", true, null);
             }
-            return new Attempt(metadata, "", false, describe(e));
+            return failure(metadata, e);
         }
     }
 
@@ -197,7 +205,7 @@ public final class DocumentParserService implements AutoCloseable {
             if (isWriteLimitReached(e)) {
                 return new Attempt(metadata, handler.toString(), true, null);
             }
-            return new Attempt(metadata, "", false, describe(e));
+            return failure(metadata, e);
         }
     }
 
@@ -213,21 +221,21 @@ public final class DocumentParserService implements AutoCloseable {
             return context;
         }
 
-        tess.setLanguage(ocr.language());                 // «rus+chi_sim», «rus+chi_sim+eng», «chi_tra»…
+        tess.setLanguage(ocr.language());                 // «rus+chi_sim+eng», «rus+chi_sim+eng», «chi_tra»…
 
         // Пути из env (сеттеры в Tika 4.x проверяют существование пути и бросают TikaConfigException)
         OcrEnv.tesseractBinary().ifPresent(bin -> {
             try {
                 tess.setTesseractPath(bin.toString());
             } catch (TikaConfigException e) {
-                System.err.println("WARN: tesseractPath (" + bin + ") отклонён: " + e.getMessage());
+                LOG.warning(() -> "tesseractPath (" + bin + ") отклонён: " + e.getMessage());
             }
         });
         OcrEnv.tessdataDir().ifPresent(dir -> {
             try {
                 tess.setTessdataPath(dir.toString());
             } catch (TikaConfigException e) {
-                System.err.println("WARN: tessdataPath (" + dir + ") отклонён: " + e.getMessage());
+                LOG.warning(() -> "tessdataPath (" + dir + ") отклонён: " + e.getMessage());
             }
         });
         context.set(TesseractOCRConfig.class, tess);
@@ -240,8 +248,8 @@ public final class DocumentParserService implements AutoCloseable {
             boolean strategyApplied = trySetAny(pdf, PDF_OCR_STRATEGY_SETTERS, "ocr_and_text");
             trySetAny(pdf, PDF_OCR_DPI_SETTERS, 150);
             if (!strategyApplied) {
-                System.err.println("WARN: постраничный рендер PDF недоступен в этой версии Tika; " +
-                        "сканы PDF обрабатываются через OCR встроенных картинок.");
+                LOG.warning("постраничный рендер PDF недоступен в этой версии Tika; "
+                        + "сканы PDF обрабатываются через OCR встроенных картинок.");
             }
         }
         context.set(PDFParserConfig.class, pdf);
@@ -253,77 +261,82 @@ public final class DocumentParserService implements AutoCloseable {
         try {
             forkParser.close();
         } catch (Exception e) {
-            System.err.println("Ошибка остановки fork-парсера: " + e.getMessage());
+            restoreInterruptFlag(e);
+            LOG.warning(() -> "ошибка остановки fork-парсера: " + e.getMessage());
         }
     }
 
     /* ─────────── версионо-зависимые вызовы API Tika 4.x ─────────── */
 
-    /**
-     * Достаёт текст из PipesForkResult, не привязываясь к конкретному имени геттера:
-     * 1) известные имена; 2) любой String-геттер с «текстовым» именем;
-     * 3) текст в метаданных; 4) null → разбор будет повторён в текущем процессе.
-     */
+    /** Текст из PipesForkResult: известные геттеры → автопоиск → метаданные → null. */
     private static String extractForkText(PipesForkResult result, Metadata meta) {
-        // 1) известные имена
-        for (String name : TEXT_GETTERS) {
-            String value = invokeGetter(result, name, String.class);
-            if (value != null && !value.isBlank()) {
-                return value;
-            }
+        String text = firstNonBlankGetter(result);
+        if (text == null) {
+            text = bestTextGetter(result);
         }
-        // 2) автопоиск: String-геттер без параметров с «текстовым» именем
-        String best = null;
-        int bestScore = 0;
-        for (Method method : result.getClass().getMethods()) {
-            if (method.getParameterCount() != 0 || method.getReturnType() != String.class) {
-                continue;
-            }
-            int score = textScore(method.getName());
-            if (score <= bestScore || score == 0) {
-                continue;
-            }
-            String value = invokeGetter(result, method.getName(), String.class);
-            if (value != null && !value.isBlank()) {
-                best = value;
-                bestScore = score;
-            }
+        if (text == null) {
+            text = textFromMetadata(meta);
         }
-        if (best != null) {
-            return best;
+        if (text == null) {
+            LOG.warning(() -> "PipesForkResult без текстового геттера; доступные методы: ["
+                    + noArgMethodNames(result) + "] — разбор повторён в текущем процессе.");
         }
-        // 3) текст могли положить в метаданные
-        if (meta != null) {
-            for (String name : meta.names()) {
-                String lower = name.toLowerCase(Locale.ROOT);
-                if (lower.contains("content") || lower.contains("text") || lower.contains("body")) {
-                    for (String value : meta.getValues(name)) {
-                        if (value != null && value.length() >= 40) {   // не заголовок/титул
-                            return value;
-                        }
-                    }
-                }
-            }
+        return text;
+    }
+
+    /** 1) известные имена текстовых геттеров. */
+    private static String firstNonBlankGetter(PipesForkResult result) {
+        return TEXT_GETTERS.stream()
+                .map(name -> invokeGetter(result, name, String.class))
+                .filter(value -> value != null && !value.isBlank())
+                .findFirst()
+                .orElse(null);
+    }
+
+    /** 2) автопоиск: String-геттер без параметров с «текстовым» именем (по убыванию приоритета). */
+    private static String bestTextGetter(PipesForkResult result) {
+        return Arrays.stream(result.getClass().getMethods())
+                .filter(m -> m.getParameterCount() == 0 && m.getReturnType() == String.class)
+                .filter(m -> textScore(m.getName()) > 0)
+                .sorted(Comparator.comparingInt((Method m) -> textScore(m.getName())).reversed())
+                .map(m -> invokeGetter(result, m.getName(), String.class))
+                .filter(value -> value != null && !value.isBlank())
+                .findFirst()
+                .orElse(null);
+    }
+
+    /** 3) текст могли положить в метаданные. */
+    private static String textFromMetadata(Metadata meta) {
+        if (meta == null) {
+            return null;
         }
-        // 4) не смогли — логируем доступные методы (поможет захардкодить точный геттер)
-        String methods = Arrays.stream(result.getClass().getMethods())
-                .filter(m -> m.getParameterCount() == 0)
-                .map(Method::getName)
-                .distinct().sorted()
-                .collect(Collectors.joining(", "));
-        System.err.println("WARN: PipesForkResult без текстового геттера; доступные методы: ["
-                + methods + "] — разбор повторён в текущем процессе.");
-        return null;
+        return Arrays.stream(meta.names())
+                .filter(name -> {
+                    String lower = name.toLowerCase(Locale.ROOT);
+                    return lower.contains("content") || lower.contains("text")
+                            || lower.contains("body");
+                })
+                .flatMap(name -> Arrays.stream(meta.getValues(name)))
+                .filter(value -> value != null && value.length() >= 40)   // не заголовок/титул
+                .findFirst()
+                .orElse(null);
     }
 
     /** Приоритет имени метода как источника текста: 4=лучший, 0=не текст. */
     private static int textScore(String name) {
         String n = name.toLowerCase(Locale.ROOT);
-        if (n.contains("text")) return 4;
-        if (n.contains("content")) return 3;
-        if (n.contains("body")) return 2;
-        if (n.contains("extract")) return 2;
-        if (n.contains("output")) return 1;
+        if (n.contains("text")) {
+            return 4;
+        }
+        if (n.contains("content")) {
+            return 3;
+        }
+        if (n.contains("body") || n.contains("extract")) {
+            return 2;
+        }
+        if (n.contains("output")) {
+            return 1;
+        }
         return 0;                                          // toString()/getClass() и пр. не берём
     }
 
@@ -343,14 +356,13 @@ public final class DocumentParserService implements AutoCloseable {
     /** Вызывает первый существующий сеттер(int|long) из списка кандидатов. */
     private static void applyFirstAvailable(PipesForkParserConfig config,
                                             List<String> setterNames, Number value) {
-        for (String setterName : setterNames) {
-            if (trySet(config, setterName, long.class, value.longValue())
-                    || trySet(config, setterName, int.class, value.intValue())) {
-                return;
-            }
+        boolean applied = setterNames.stream()
+                .anyMatch(name -> trySet(config, name, long.class, value.longValue())
+                        || trySet(config, name, int.class, value.intValue()));
+        if (!applied) {
+            LOG.warning(() -> "не найден сеттер " + setterNames.get(0) + "(...), "
+                    + "используется значение Tika по умолчанию.");
         }
-        System.err.println("WARN: не найден сеттер " + setterNames.get(0) + "(...), " +
-                "используется значение Tika по умолчанию.");
     }
 
     private static boolean trySet(Object target, String name, Class<?> type, Object value) {
@@ -363,38 +375,140 @@ public final class DocumentParserService implements AutoCloseable {
         }
     }
 
-    /** Вызывает первый найденный сеттер (String/int/enum) из списка кандидатов имён. */
+    /** Вызывает первый подходящий сеттер (String/int/enum) из списка кандидатов имён. */
     private static boolean trySetAny(Object target, List<String> setterNames, Object value) {
-        for (Method method : target.getClass().getMethods()) {
-            if (!setterNames.contains(method.getName()) || method.getParameterCount() != 1) {
-                continue;
-            }
-            Class<?> type = method.getParameterTypes()[0];
-            Object arg = null;
-            if (type == String.class) {
-                arg = String.valueOf(value);
-            } else if (type == int.class || type == Integer.class) {
-                arg = Integer.valueOf(String.valueOf(value));
-            } else if (type.isEnum() && value instanceof String text) {
-                String normalized = text.replace('-', '_').toUpperCase(Locale.ROOT);
-                for (Object constant : type.getEnumConstants()) {
-                    if (((Enum<?>) constant).name().equals(normalized)) {
-                        arg = constant;
-                        break;
-                    }
-                }
-            }
-            if (arg == null) {
-                continue;
-            }
-            try {
-                method.invoke(target, arg);
-                return true;
-            } catch (ReflectiveOperationException | IllegalArgumentException e) {
-                // пробуем следующую перегрузку/имя
-            }
+        return Arrays.stream(target.getClass().getMethods())
+                .filter(m -> setterNames.contains(m.getName()) && m.getParameterCount() == 1)
+                .anyMatch(m -> tryInvoke(m, target, coerceArg(m.getParameterTypes()[0], value)));
+    }
+
+    /** Приводит значение к типу параметра сеттера; null — если тип не поддерживается. */
+    private static Object coerceArg(Class<?> type, Object value) {
+        if (type == String.class) {
+            return String.valueOf(value);
         }
-        return false;
+        if (type == int.class || type == Integer.class) {
+            return Integer.valueOf(String.valueOf(value));
+        }
+        if (type.isEnum() && value instanceof String text) {
+            return enumConstant(type, text);
+        }
+        return null;
+    }
+
+    private static Object enumConstant(Class<?> enumType, String name) {
+        String normalized = name.replace('-', '_').toUpperCase(Locale.ROOT);
+        return Arrays.stream(enumType.getEnumConstants())
+                .filter(c -> ((Enum<?>) c).name().equals(normalized))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private static boolean tryInvoke(Method method, Object target, Object arg) {
+        if (arg == null) {
+            return false;
+        }
+        try {
+            method.invoke(target, arg);                    // пробуем следующую перегрузку/имя при сбое
+            return true;
+        } catch (ReflectiveOperationException | IllegalArgumentException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Таймаут задачи форка. В Tika 4.x он вынесен в отдельный объект (TimeoutLimits),
+     * подключаемый через setTimeoutLimits(...). Тип объекта и имя внутреннего сеттера
+     * определяем рефлексией: числовой сеттер, содержащий «timeout» (приоритет — «task»/«parse»),
+     * единицы — мс, если имя не содержит «second».
+     */
+    private static void applyTaskTimeoutLimits(PipesForkParserConfig config, long millis) {
+        Optional<Method> setter = timeoutLimitsSetter(config);
+        if (setter.isEmpty()) {
+            LOG.warning(() -> "в PipesForkParserConfig нет setTimeoutLimits — таймаут задачи "
+                    + "остаётся по умолчанию. Сеттеры: " + setterNames(config));
+            return;
+        }
+        Class<?> limitsType = setter.get().getParameterTypes()[0];
+        Object limits;
+        try {
+            limits = limitsType.getDeclaredConstructor().newInstance();
+        } catch (ReflectiveOperationException e) {
+            LOG.warning(() -> "не удалось создать " + limitsType.getName() + ": " + e.getMessage());
+            return;
+        }
+        Optional<Method> taskTimeout = taskTimeoutSetter(limitsType);
+        if (taskTimeout.isEmpty()) {
+            LOG.warning(() -> "в " + limitsType.getSimpleName() + " нет сеттера таймаута задачи — "
+                    + "используется значение Tika по умолчанию. Сеттеры: " + setterNames(limits));
+            return;
+        }
+        Method apply = taskTimeout.get();
+        Object arg = timeoutArg(apply, millis);
+        try {
+            apply.invoke(limits, arg);
+            setter.get().invoke(config, limits);
+            LOG.info(() -> "таймаут задачи форка → " + limitsType.getSimpleName()
+                    + "." + apply.getName() + "(" + arg + ")");
+        } catch (ReflectiveOperationException e) {
+            LOG.warning(() -> "не удалось применить " + apply.getName() + ": " + e.getMessage());
+        }
+    }
+
+    /** Метод setTimeoutLimits(...) с единственным параметром. */
+    private static Optional<Method> timeoutLimitsSetter(PipesForkParserConfig config) {
+        return Arrays.stream(config.getClass().getMethods())
+                .filter(m -> m.getName().equals("setTimeoutLimits") && m.getParameterCount() == 1)
+                .findFirst();
+    }
+
+    /** Числовой сеттер таймаута ЗАДАЧИ (не ожидания/завершения) с максимальным приоритетом. */
+    private static Optional<Method> taskTimeoutSetter(Class<?> limitsType) {
+        return Arrays.stream(limitsType.getMethods())
+                .filter(m -> m.getParameterCount() == 1)
+                .filter(m -> m.getName().startsWith("set"))
+                .filter(DocumentParserService::isTimeoutSetter)
+                .max(Comparator.comparingInt(m -> taskTimeoutScore(m.getName())));
+    }
+
+    /** Сеттер с числовым или Duration-параметром и «timeout» в имени. */
+    private static boolean isTimeoutSetter(Method method) {
+        Class<?> type = method.getParameterTypes()[0];
+        boolean numeric = type == long.class || type == Long.class
+                || type == int.class || type == Integer.class;
+        boolean timeout = method.getName().toLowerCase(Locale.ROOT).contains("timeout");
+        return timeout && (numeric || type == Duration.class);
+    }
+
+    /** Приоритет сеттера таймаута: +3 «task»/«parse», +1 «millis», −4 «wait»/«idle»/… */
+    private static int taskTimeoutScore(String setterName) {
+        String name = setterName.toLowerCase(Locale.ROOT);
+        int score = 0;
+        if (name.contains("task") || name.contains("parse")) {
+            score += 3;
+        }
+        if (name.contains("millis")) {
+            score += 1;
+        }
+        if (NON_TASK_TIMEOUT_MARKERS.stream().anyMatch(name::contains)) {
+            score -= 4;
+        }
+        return score;
+    }
+
+    /** Аргумент сеттера: Duration, int или long; мс или секунды (по имени метода). */
+    private static Object timeoutArg(Method setter, long millis) {
+        String name = setter.getName().toLowerCase(Locale.ROOT);
+        boolean seconds = name.contains("second") && !name.contains("millis");
+        long value = seconds ? Math.max(1, millis / 1000) : millis;
+        Class<?> type = setter.getParameterTypes()[0];
+        if (type == Duration.class) {
+            return Duration.ofMillis(millis);
+        }
+        if (type == int.class || type == Integer.class) {
+            return (int) Math.min(value, Integer.MAX_VALUE);
+        }
+        return value;
     }
 
     private static String javaBin() {
@@ -425,6 +539,23 @@ public final class DocumentParserService implements AutoCloseable {
         return false;
     }
 
+    /** Попытка-ошибка; если разбор был прерван — восстанавливаем флаг прерывания потока. */
+    private static Attempt failure(Metadata metadata, Throwable e) {
+        restoreInterruptFlag(e);
+        return new Attempt(metadata, "", false, describe(e));
+    }
+
+    /** InterruptedException в цепочке причин → восстановить флаг прерывания потока. */
+    private static void restoreInterruptFlag(Throwable t) {
+        while (t != null) {
+            if (t instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            t = t.getCause();
+        }
+    }
+
     private static String describe(Throwable t) {
         if (t == null) {
             return "Unknown error";
@@ -439,110 +570,22 @@ public final class DocumentParserService implements AutoCloseable {
             throw new IllegalStateException("SHA-256 algorithm not available", e);
         }
     }
-    /**
-     * Таймаут задачи форка: точное имя сеттера зависит от минорной версии Tika,
-     * поэтому ищем любой числовой сеттер вида set*timeout* (приоритет — содержащим
-     * «task»/«parse»), единицы определяем по имени («millis» → мс, иначе считаем секундами).
-     */
-    /**
-     * Таймаут задачи форка. В Tika 4.x он вынесен в отдельный объект (TimeoutLimits),
-     * который подключается через setTimeoutLimits(...). Тип объекта и имя внутреннего
-     * сеттера определяем рефлексией: ищем числовой сеттер, содержащий «timeout»
-     * (приоритет — «task»/«parse»; единицы — мс, если имя не содержит «second»).
-     */
-    private static void applyTaskTimeoutLimits(PipesForkParserConfig config, long millis) {
-        // 1) метод setTimeoutLimits(...) и класс его параметра
-        Method setter = null;
-        for (Method method : config.getClass().getMethods()) {
-            if (method.getName().equals("setTimeoutLimits") && method.getParameterCount() == 1) {
-                setter = method;
-                break;
-            }
-        }
-        if (setter == null) {
-            System.err.println("WARN: в PipesForkParserConfig нет setTimeoutLimits — таймаут задачи "
-                    + "остаётся по умолчанию. Сеттеры: " + setterNames(config));
-            return;
-        }
-        Class<?> limitsType = setter.getParameterTypes()[0];
-        Object limits;
-        try {
-            limits = limitsType.getDeclaredConstructor().newInstance();
-        } catch (ReflectiveOperationException e) {
-            System.err.println("WARN: не удалось создать " + limitsType.getName()
-                    + ": " + e.getMessage());
-            return;
-        }
 
-        // 2) внутри объекта — числовой сеттер таймаута ЗАДАЧИ (не ожидания/завершения)
-        Method best = null;
-        int bestScore = Integer.MIN_VALUE;
-        for (Method method : limitsType.getMethods()) {
-            if (method.getParameterCount() != 1 || !method.getName().startsWith("set")) {
-                continue;
-            }
-            Class<?> type = method.getParameterTypes()[0];
-            boolean numeric = type == long.class || type == Long.class
-                    || type == int.class || type == Integer.class;
-            if (!numeric && type != java.time.Duration.class) {
-                continue;
-            }
-            String name = method.getName().toLowerCase(Locale.ROOT);
-            if (!name.contains("timeout")) {
-                continue;
-            }
-            int score = 0;
-            if (name.contains("task") || name.contains("parse")) {
-                score += 3;
-            }
-            if (name.contains("millis")) {
-                score += 1;
-            }
-            if (name.contains("wait") || name.contains("idle") || name.contains("shutdown")
-                    || name.contains("exit") || name.contains("noresponse")
-                    || name.contains("submit") || name.contains("emt")) {
-                score -= 4;
-            }
-            if (score > bestScore) {
-                best = method;
-                bestScore = score;
-            }
-        }
-        if (best == null) {
-            System.err.println("WARN: в " + limitsType.getSimpleName() + " нет сеттера таймаута задачи — "
-                    + "используется значение Tika по умолчанию. Сеттеры: " + setterNames(limits));
-            return;
-        }
-
-        // 3) единицы: мс, если только имя не указывает секунды
-        String name = best.getName();
-        boolean seconds = name.toLowerCase(Locale.ROOT).contains("second")
-                && !name.toLowerCase(Locale.ROOT).contains("millis");
-        long value = seconds ? Math.max(1, millis / 1000) : millis;
-        try {
-            Class<?> type = best.getParameterTypes()[0];
-            Object arg;
-            if (type == java.time.Duration.class) {
-                arg = java.time.Duration.ofMillis(millis);
-            } else if (type == int.class || type == Integer.class) {
-                arg = Integer.valueOf((int) Math.min(value, Integer.MAX_VALUE));
-            } else {
-                arg = Long.valueOf(value);
-            }
-            best.invoke(limits, arg);
-            setter.invoke(config, limits);
-            System.out.println("INFO: таймаут задачи форка → " + limitsType.getSimpleName()
-                    + "." + name + "(" + arg + ")");
-        } catch (ReflectiveOperationException e) {
-            System.err.println("WARN: не удалось применить " + name + ": " + e.getMessage());
-        }
-    }
     /** Имена всех сеттеров объекта — для диагностики, когда ожидаемый метод не найден. */
     private static String setterNames(Object target) {
-        return java.util.Arrays.stream(target.getClass().getMethods())
+        return Arrays.stream(target.getClass().getMethods())
                 .filter(m -> m.getName().startsWith("set") && m.getParameterCount() == 1)
                 .map(Method::getName)
                 .distinct().sorted()
-                .collect(java.util.stream.Collectors.joining(", "));
+                .collect(Collectors.joining(", "));
+    }
+
+    /** Имена всех методов без параметров — диагностика доступного API PipesForkResult. */
+    private static String noArgMethodNames(Object target) {
+        return Arrays.stream(target.getClass().getMethods())
+                .filter(m -> m.getParameterCount() == 0)
+                .map(Method::getName)
+                .distinct().sorted()
+                .collect(Collectors.joining(", "));
     }
 }

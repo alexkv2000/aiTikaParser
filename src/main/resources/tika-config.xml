@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <properties>
+    <text-recognizers>
+        <text-recognizer class="org.apache.tika.parser.ocr.TesseractOCRParser"/>
+    </text-recognizers>
     <parsers>
         <!-- все стандартные парсеры, кроме двух настраиваемых явно -->
         <parser class="org.apache.tika.parser.DefaultParser">
@@ -8,7 +11,8 @@
         </parser>
         <parser class="org.apache.tika.parser.ocr.TesseractOCRParser">
             <params>
-                <param name="language" type="string">rus+chi_sim</param>
+<!--                <param name="language" type="string">rus+chi_sim</param>rus+eng-->
+                <param name="language" type="string">rus+eng</param>
             </params>
         </parser>
         <parser class="org.apache.tika.parser.pdf.PDFParser">

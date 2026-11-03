@@ -7,8 +7,16 @@ import org.example.parser.OcrEnv;
 import org.example.server.ChatServer;
 
 import java.io.IOException;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
+/**
+ * Точка входа: читает настройки (args/env), собирает парсер и поднимает HTTP-сервер.
+ */
 public final class Main {
+
+    /** java.util.logging — без внешних зависимостей; по умолчанию WARNING+ идут в stderr. */
+    private static final Logger LOG = Logger.getLogger(Main.class.getName());
 
     public static void main(String[] args) {
         int port = intArgOrEnv(args, 0, "PORT", 8081);
@@ -19,7 +27,7 @@ public final class Main {
         try {
             parserService = new DocumentParserService(maxForks, maxChars);
         } catch (TikaConfigException | IOException e) {
-            System.err.println("Не удалось инициализировать PipesForkParser: " + e.getMessage());
+            LOG.log(Level.SEVERE, "Не удалось инициализировать PipesForkParser: {0}", e.getMessage());
             System.exit(1);
             return;
         }
@@ -28,7 +36,7 @@ public final class Main {
         try {
             server.start();
         } catch (IOException e) {
-            System.err.println("Не удалось запустить сервер на порту " + port + ": " + e.getMessage());
+            LOG.severe(() -> "Не удалось запустить сервер на порту " + port + ": " + e.getMessage());
             parserService.close();
             System.exit(1);
             return;
@@ -39,42 +47,57 @@ public final class Main {
             parserService.close();
         }));
 
-        System.out.print(banner(port, maxForks, maxChars));
+        printBanner(port, maxForks, maxChars);
         if (!ocrAvailable()) {
-            System.err.println("⚠ Tesseract не найден: " + OcrEnv.status());
+            LOG.warning(() -> "Tesseract не найден: " + OcrEnv.status());
         }
     }
 
-    /** Доступен ли бинарник Tesseract (для предупреждения при старте). */
+    /**
+     * Баннер о запуске — намеренный вывод в консоль (UI приложения), а не логирование.
+     * Поэтому S106 подавлен точечно и только здесь.
+     */
+    @SuppressWarnings("java:S106")
+    private static void printBanner(int port, int maxForks, int maxChars) {
+        System.out.print(banner(port, maxForks, maxChars));
+    }
+
     /** Доступен ли Tesseract: наша проверка (env/PATH/стандартные каталоги) + проверка Tika. */
     private static boolean ocrAvailable() {
         if (OcrEnv.tesseractBinary().isPresent()) {
             return true;
         }
-        try {
-            return new TesseractOCRParser().hasTesseract();
-        } catch (Throwable t) {
+        // TesseractOCRParser — Closeable, поэтому try-with-resources (S2095)
+        try (TesseractOCRParser tika = new TesseractOCRParser()) {
+            return tika.hasTesseract();
+        } catch (Exception e) {
+            LOG.log(Level.FINE, "Проверка Tika (TesseractOCRParser) не удалась", e);
             return false;
         }
     }
 
+    /** Целое из строки или null, если строка null/некорректна. */
+    private static Integer tryParse(String raw) {
+        if (raw == null) {
+            return null;
+        }
+        try {
+            return Integer.parseInt(raw.trim());
+        } catch (NumberFormatException e) {
+            LOG.fine(() -> "Некорректное целое '" + raw + "', использую значение по умолчанию");
+            return null;
+        }
+    }
+
+    /** Приоритет: аргумент CLI → переменная окружения → значение по умолчанию. */
     private static int intArgOrEnv(String[] args, int idx, String env, int def) {
-        if (args.length > idx) {
-            try { return Integer.parseInt(args[idx]); } catch (NumberFormatException ignored) { }
-        }
-        String v = System.getenv(env);
-        if (v != null) {
-            try { return Integer.parseInt(v); } catch (NumberFormatException ignored) { }
-        }
-        return def;
+        Integer arg = args.length > idx ? tryParse(args[idx]) : null;
+        return arg != null ? arg : intEnv(env, def);
     }
 
     private static int intEnv(String env, int def) {
-        String v = System.getenv(env);
-        if (v != null) {
-            try { return Integer.parseInt(v); } catch (NumberFormatException ignored) { }
-        }
-        return def;
+        Integer parsed = tryParse(System.getenv(env));
+        return parsed != null ? parsed : def;
     }
 
     private static String banner(int port, int maxForks, int maxChars) {
@@ -93,7 +116,7 @@ public final class Main {
                           ?meta=false — отключить выдачу метаданных;
                           ?charset=GBK — кодировка legacy .txt;
                           ?ocr=false — выключить OCR;
-                          ?ocrLang=rus+chi_sim — языки распознавания;
+                          ?ocrLang=rus+eng — языки распознавания;
                           ?ocrScan=true — постраничный OCR сканов PDF)
 
                   Пример (curl):

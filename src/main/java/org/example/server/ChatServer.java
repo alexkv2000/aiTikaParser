@@ -96,11 +96,11 @@ public final class ChatServer {
             String charset = queryParam(ex, "charset").orElse("");
 
             // ── OCR (Tesseract): сканы и картинки, включая встроенные в doc/docx/pdf ──
-            // ?ocr=false — выключить; ?ocrLang=rus+chi_sim — языки; ?ocrScan=true — сканы PDF
+            // ?ocr=false — выключить; ?ocrLang=rus+chi_sim+eng — языки; ?ocrScan=true — сканы PDF
             boolean ocrEnabled = resolveFlag(ex, parts, "ocr", true);
             String ocrLang = queryParam(ex, "ocrLang")
                     .or(() -> textField(parts, "ocrLang"))
-                    .orElse("rus+chi_sim")
+                    .orElse("rus+eng")
                     .replace(' ', '+');   // «+» в URL мог прийти как пробел после декодирования
             boolean ocrScan = resolveFlag(ex, parts, "ocrScan", false);
             OcrOptions ocrOptions = new OcrOptions(ocrEnabled, ocrLang, ocrScan);

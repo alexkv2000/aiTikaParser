@@ -1,8 +1,6 @@
 package org.example.chat;
 
 import org.example.parser.ParsedDocument;
-
-import java.util.Locale;
 import java.util.Map;
 import java.util.stream.Collectors;
 
@@ -49,9 +47,7 @@ public final class ChatFormatter {
                 .append(String.format("      Размер      : %s (%d байт)%n",
                         humanSize(doc.sizeBytes()), doc.sizeBytes()))
                 .append(String.format("      SHA-256     : %s%n", shortHash(doc.sha256())))
-                .append(String.format("      Время разбора: %d мс%n", doc.elapsedMs()));
-
-               */
+                .append(String.format("      Время разбора: %d мс%n", doc.elapsedMs())); */
 
         // Блок метаданных выводится только при включённом признаке
         if (includeMetadata && !doc.metadata().isEmpty()) {
@@ -86,9 +82,9 @@ public final class ChatFormatter {
 
     /* ────────────────────────── утилиты ────────────────────────── */
 
-    private static String shortHash(String hash) {
-        return hash.length() <= 24 ? hash : hash.substring(0, 24) + "...";
-    }
+//    private static String shortHash(String hash) {
+//        return hash.length() <= 24 ? hash : hash.substring(0, 24) + "...";
+//    }
 
     private static String indent(String text, String padding) {
         return text.lines().map(line -> padding + line).collect(Collectors.joining("\n"));
@@ -99,10 +95,10 @@ public final class ChatFormatter {
         return clean.length() <= maxWidth ? clean : clean.substring(0, maxWidth - 1) + "…";
     }
 
-    private static String humanSize(long bytes) {
-        if (bytes < 1024) return bytes + " Б";
-        String[] units = {"КБ", "МБ", "ГБ", "ТБ"};
-        int exp = (int) (Math.log(bytes) / Math.log(1024));
-        return String.format(Locale.ROOT, "%.1f %s", bytes / Math.pow(1024, exp), units[exp - 1]);
-    }
+//    private static String humanSize(long bytes) {
+//        if (bytes < 1024) return bytes + " Б";
+//        String[] units = {"КБ", "МБ", "ГБ", "ТБ"};
+//        int exp = (int) (Math.log(bytes) / Math.log(1024));
+//        return String.format(Locale.ROOT, "%.1f %s", bytes / Math.pow(1024, exp), units[exp - 1]);
+//    }
 }

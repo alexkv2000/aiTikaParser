@@ -38,14 +38,14 @@ public final class ChatPage {
               <div id="chat">
                 <div class="msg bot">Привет! Прикрепите файлы (docx, pdf, xlsx, pptx, txt, html,
             сканы png/jpg и т.д.) и нажмите «Отправить» — я разберу их через Apache Tika.
-            Для сканов и картинок включён OCR (rus+chi_sim). Снимите галочку «Метаданные»,
+            Для сканов и картинок включён OCR (rus+eng). Снимите галочку «Метаданные»,
             чтобы получать только текст. «Скан PDF» — для PDF без текстового слоя.</div>
               </div>
               <form id="form">
                 <input id="msg" type="text" placeholder="Сообщение (необязательно)">
                 <label><input type="checkbox" id="meta" checked> Метаданные</label>
                 <label><input type="checkbox" id="ocr" checked> OCR</label>
-                <input id="ocrLang" type="text" value="rus+chi_sim" title="Языки OCR: rus+chi_sim+eng, chi_tra...">
+                <input id="ocrLang" type="text" value="rus+eng" title="Языки OCR: rus+eng, chi_tra...">
                 <label><input type="checkbox" id="ocrScan"> Скан PDF</label>
                 <input id="files" type="file" multiple required>
                 <button type="submit">Отправить</button>

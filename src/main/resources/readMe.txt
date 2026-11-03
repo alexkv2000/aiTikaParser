@@ -1,4 +1,7 @@
 ЗАПУСК
+set TESSERACT_PATH=C:\Program Files\Tesseract-OCR\tesseract.exe
+set TESSDATA_PATH=C:\Program Files\Tesseract-OCR\tessdata
+
 set MAX_FORKS=8 - кол-во одновременных файлов в обработке
 java -jar target\ai_tika_parser-1.0-SNAPSHOT.jar
 
@@ -34,7 +37,8 @@ PostMan
     ocrLang     Text rus+chi_sim                         нет (по умолчанию rus+chi_sim)
     ocrScan     Text true                                нет (по умолчанию false)
 
-    Параметры можно передавать и в URL: ?meta=false&ocr=true&ocrLang=rus%2Bchi_sim
+    cmd "C:\Program Files\Tesseract-OCR\tesseract.exe" --list-langs
+    Параметры можно передавать и в URL: ?meta=false&ocr=true&ocrLang=rus+chi_sim+eng
 
     Примеры (curl):
       скан-картинка рус+кит:
@@ -43,3 +47,4 @@ PostMan
         curl -s -F "files=@contract_scan.pdf" "http://localhost:8081/api/chat/message?ocrScan=true"
       docx со вставленными скриншотами (OCR встроенных картинок — автоматически):
         curl -s -F "files=@otchet.docx" http://localhost:8081/api/chat/message
+        curl -s -F "message=Разбери вложения" -F "files=@C:\Users\KvochkinAY\OneDrive\Документы\pdf_test_image.pdf" "http://localhost:8081/api/chat/message"

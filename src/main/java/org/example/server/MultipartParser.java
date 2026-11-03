@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -18,14 +19,41 @@ public final class MultipartParser {
         public boolean isFile() {
             return fileName != null && !fileName.isBlank();
         }
+        /**
+         * По значению, включая содержимое byte[]: автогенерированный equals
+         * рекорда сравнивает массив по ссылке.
+         */
+        @Override
+        public boolean equals(Object o) {
+            return o instanceof Part other
+                    && Objects.equals(fieldName, other.fieldName)
+                    && Objects.equals(fileName, other.fileName)
+                    && Objects.equals(contentType, other.contentType)
+                    && Arrays.equals(content, other.content);
+        }
+        @Override
+        public int hashCode() {
+            int result = Objects.hashCode(fieldName);
+            result = 31 * result + Objects.hashCode(fileName);
+            result = 31 * result + Objects.hashCode(contentType);
+            result = 31 * result + Arrays.hashCode(content);
+            return result;
+        }
+        @Override
+        public String toString() {
+            return "Part[" + fieldName
+                    + ", file=" + fileName
+                    + ", type=" + contentType
+                    + ", " + content.length + " bytes]";
+        }
     }
 
     private static final Pattern BOUNDARY =
-            Pattern.compile("boundary\\s*=\\s*\"?([^\";]+)\"?", Pattern.CASE_INSENSITIVE);
+            Pattern.compile("boundary\\s*=\\s*\"?([^\";]++)\"?", Pattern.CASE_INSENSITIVE);
     private static final Pattern FIELD_NAME =
-            Pattern.compile("name\\s*=\\s*\"((?:\\\\.|[^\"])*)\"");
+            Pattern.compile("name\\s*=\\s*\"((?:\\\\.|[^\"\\\\])*+)\"");
     private static final Pattern FILE_NAME =
-            Pattern.compile("filename\\s*=\\s*\"((?:\\\\.|[^\"])*)\"");
+            Pattern.compile("filename\\s*=\\s*\"((?:\\\\.|[^\"\\\\])*+)\"");
 
     private static final byte[] CR_LF          = {'\r', '\n'};
     private static final byte[] HEADERS_END    = {'\r', '\n', '\r', '\n'};
@@ -110,7 +138,9 @@ public final class MultipartParser {
     }
 
     private static String firstGroup(String header, Pattern pattern, String defaultValue) {
-        if (header == null) return defaultValue;
+        if (header == null) {
+            return defaultValue;
+        }
         Matcher matcher = pattern.matcher(header);
         return matcher.find() ? matcher.group(1) : defaultValue;
     }
@@ -120,31 +150,36 @@ public final class MultipartParser {
     }
 
     private static int indexOf(byte[] data, byte[] pattern, int from) {
-        outer:
         for (int i = Math.max(0, from); i <= data.length - pattern.length; i++) {
-            for (int j = 0; j < pattern.length; j++) {
-                if (data[i + j] != pattern[j]) continue outer;
+            if (matchesAt(data, i, pattern)) {
+                return i;
             }
-            return i;
         }
         return -1;
     }
 
-    private static boolean startsWith(byte[] data, int offset, byte[] pattern) {
-        if (offset < 0 || offset + pattern.length > data.length) return false;
+    /** Все байты pattern совпадают с data, начиная с offset (границы сверху проверяет вызывающий). */
+    private static boolean matchesAt(byte[] data, int offset, byte[] pattern) {
         for (int i = 0; i < pattern.length; i++) {
-            if (data[offset + i] != pattern[i]) return false;
+            if (data[offset + i] != pattern[i]) {
+                return false;
+            }
         }
         return true;
     }
 
+    private static boolean startsWith(byte[] data, int offset, byte[] pattern) {
+        return offset >= 0
+                && offset + pattern.length <= data.length
+                && matchesAt(data, offset, pattern);
+    }
+
     private static boolean endsWith(byte[] data, int from, int to, byte[] pattern) {
-        if (to - from < pattern.length || to > data.length) return false;
-        int offset = to - pattern.length;
-        for (int i = 0; i < pattern.length; i++) {
-            if (data[offset + i] != pattern[i]) return false;
+        if (to - from < pattern.length || to > data.length) {
+            return false;
         }
-        return true;
+        int offset = to - pattern.length;
+        return matchesAt(data, offset, pattern);
     }
 
     private static int skip(byte[] data, int offset, byte[] pattern) {
