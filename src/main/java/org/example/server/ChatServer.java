@@ -2,7 +2,6 @@ package org.example.server;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
-import org.apache.tika.parser.ocr.TesseractOCRParser;
 import org.example.chat.ChatFormatter;
 import org.example.chat.ChatPage;
 import org.example.parser.DocumentParserService;
